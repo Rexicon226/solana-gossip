@@ -7,11 +7,12 @@ const posix = std.posix;
 const spec = @import("spec.zig");
 const Bloom = @import("Bloom.zig");
 
-const Filter = spec.Filter;
 const ContactInfo = spec.ContactInfo;
 const PushMessage = spec.PushMessage;
 const GossipData = spec.GossipData;
+const PingMessage = spec.PingMessage;
 const LegacyVersion2 = spec.LegacyVersion2;
+const Messages = spec.Messages;
 
 const Address = std.net.Address;
 
@@ -37,10 +38,10 @@ prng: std.Random.DefaultPrng,
 entrypoints: []const Address,
 
 // all the rates are in milliseconds
-const PULL_REQUEST_RATE = 5_000;
+const PULL_REQUEST_RATE = 2_000;
 const MTU = 1232;
 
-const NUM_KEYS = 0;
+const NUM_KEYS = 8;
 const FALSE_POSITIVE_RATE = 0.1;
 
 const our_version: LegacyVersion2 = .{
@@ -52,6 +53,8 @@ const our_version: LegacyVersion2 = .{
 };
 
 const Crds = struct {
+    failed_inserts: std.DoublyLinkedList,
+
     fn advance(c: *Crds) void {
         _ = c;
     }
@@ -87,23 +90,27 @@ pub fn init(
     };
 }
 
+const DEPTH = 20;
+
 pub fn run(g: *Gossip) !void {
     var loop: xev.Loop = try .init(.{});
     defer loop.deinit();
 
+    var buffers: [DEPTH][MTU]u8 = undefined;
+    var states: [DEPTH]xev.UDP.State = undefined;
+    var reply_completions: [DEPTH]xev.Completion = undefined;
     // setup the callback for when we recveive data from the network.
-    var read_buffer: [MTU]u8 = undefined;
-    var state: xev.UDP.State = undefined;
-    var gossip_reply_completion: xev.Completion = undefined;
-    g.gossip_reply.read(
-        &loop,
-        &gossip_reply_completion,
-        &state,
-        .{ .slice = &read_buffer },
-        Gossip,
-        g,
-        onGossipReply,
-    );
+    for (&buffers, &states, &reply_completions) |*read_buffer, *state, *completion| {
+        g.gossip_reply.read(
+            &loop,
+            completion,
+            state,
+            .{ .slice = read_buffer },
+            Gossip,
+            g,
+            onGossipReply,
+        );
+    }
 
     // setup our pull request timer to trigger every 5 seconds.
     var pull_request_completion: xev.Completion = undefined;
@@ -120,35 +127,26 @@ pub fn run(g: *Gossip) !void {
     // by sending messages to the peer identified by the entrypoint. The node sends:
     // - two push messages containing its own Version and NodeInstance
     // - a pull request that contains the node's own LegacyContactInfo
-    try g.sendPushMessage(
-        g.entrypoints,
-        &.{
-            .{ .version = .{
-                .from = g.keypair.public_key,
-                .wallclock = wallclock(),
-                .version = our_version,
-            } },
-            .{ .node_instance = .{
-                .from = g.keypair.public_key,
-                .wallclock = wallclock(),
-                .timestamp = g.startup_timestamp,
-                .token = g.prng.random().int(u64),
-            } },
-        },
-    );
+    // try g.sendPushMessage(
+    //     g.entrypoints,
+    //     &.{
+    //         .{ .version = .{
+    //             .from = g.keypair.public_key,
+    //             .wallclock = wallclock(),
+    //             .version = our_version,
+    //         } },
+    //         .{ .node_instance = .{
+    //             .from = g.keypair.public_key,
+    //             .wallclock = wallclock(),
+    //             .timestamp = g.startup_timestamp,
+    //             .token = g.prng.random().int(u64),
+    //         } },
+    //     },
+    // );
     // we send the pull request in our timer callback
 
     try loop.run(.until_done);
 }
-
-const Messages = enum(u32) {
-    pull_request,
-    pull_response,
-    push_message,
-    prune_message,
-    ping_message,
-    pong_message,
-};
 
 /// Sends the provided push message to each target.
 fn sendPushMessage(
@@ -181,7 +179,7 @@ fn sendPullRequest(g: *Gossip, data: GossipData) !void {
     const random = g.prng.random();
 
     // TODO: get from crds table
-    const num_items = @max(512, 256);
+    const num_items = 0;
     // const max_bits: f64 = @floatFromInt(8 * (MTU - 4 - 8 - (8 * NUM_KEYS) - 1 - 8 - 8 - 8 - 8 - 4 - LegacyContactInfo.SIZE));
     const max_bits: f64 = 123;
 
@@ -272,26 +270,70 @@ fn serializeData(writer: *std.Io.Writer, kp: *const KeyPair, data: GossipData) !
 
 fn onGossipReply(
     maybe_gossip: ?*Gossip,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
+    _: *xev.Loop,
+    _: *xev.Completion,
     _: *xev.UDP.State,
-    peer_address: std.net.Address,
+    peer_address: Address,
     _: xev.UDP,
     read_buffer: xev.ReadBuffer,
     read_error: xev.ReadError!usize,
 ) xev.CallbackAction {
-    errdefer |err| std.debug.panic("onGossipReply failed with: '{s}'", .{@errorName(err)});
-    const bytes_read = try read_error;
+    const log = std.log.scoped(.gossip_reply);
 
-    _ = peer_address;
-    _ = read_buffer;
-    _ = maybe_gossip;
-    _ = loop;
-    _ = completion;
+    const bytes_read = read_error catch |err| {
+        log.err("onGossipReply failed to read: {t}", .{err});
+        return .disarm;
+    };
+    if (bytes_read < 4) return .rearm;
+    const bytes = read_buffer.slice[0..bytes_read];
+    return onGossipReplyInner(maybe_gossip.?, bytes, peer_address) catch |err| {
+        log.err("onGossipReply failed with: {t}", .{err});
+        return .rearm;
+    };
+}
 
-    std.debug.print("recved something {d}\n", .{bytes_read});
+fn onGossipReplyInner(
+    gossip: *const Gossip,
+    bytes: []const u8,
+    peer_address: Address,
+) !xev.CallbackAction {
+    const log = std.log.scoped(.gossip_reply);
 
-    return .disarm;
+    const tag: u32 = @bitCast(bytes[0..4].*);
+    const ty: Messages = std.enums.fromInt(Messages, tag) orelse {
+        log.warn("got unknwon message tag: {d}", .{tag});
+        return .rearm;
+    };
+    log.info("received {t} from {f}", .{ ty, peer_address });
+
+    switch (ty) {
+        .ping_message => {
+            const message_bytes = bytes[4..];
+            const message: PingMessage = try .fromBytes(message_bytes);
+
+            // verify the signature
+            try message.signature.verify(&message.token, message.from);
+
+            // create a pong message to send back
+            var response: [PingMessage.SIZE + 4]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&response);
+            try message.response(&gossip.keypair, &writer);
+
+            log.info("sending pong message to {f}", .{peer_address});
+
+            const bytes_sent = try std.posix.sendto(
+                gossip.gossip_socket,
+                writer.buffered(),
+                0,
+                &peer_address.any,
+                peer_address.getOsSockLen(),
+            );
+            std.debug.assert(bytes_sent == writer.end);
+        },
+        else => log.err("TODO: handle {t} message", .{ty}),
+    }
+
+    return .rearm;
 }
 
 fn onPullRequest(
@@ -301,9 +343,10 @@ fn onPullRequest(
     timer_error: xev.Timer.RunError!void,
 ) xev.CallbackAction {
     errdefer |err| std.debug.panic("onPullRequest failed with: '{s}'", .{@errorName(err)});
+    const log = std.log.scoped(.pull_request);
+
     try timer_error;
 
-    const log = std.log.scoped(.pull_request);
     log.info("creating pull request", .{});
 
     const gossip = maybe_gossip.?;

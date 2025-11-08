@@ -6,10 +6,20 @@ const std = @import("std");
 const Bloom = @import("Bloom.zig");
 
 const Address = std.net.Address;
-
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const Ed25519 = std.crypto.sign.Ed25519;
+const KeyPair = Ed25519.KeyPair;
 const Signature = Ed25519.Signature;
 const Pubkey = Ed25519.PublicKey;
+
+pub const Messages = enum(u32) {
+    pull_request,
+    pull_response,
+    push_message,
+    prune_message,
+    ping_message,
+    pong_message,
+};
 
 const any_address: Address = .initIp4(.{ 0, 0, 0, 0 }, 0);
 
@@ -23,12 +33,12 @@ pub const IpAddress = struct {
 pub const PullRequest = struct {
     filter: Filter,
     gossip_data: SignedGossipData,
-};
 
-pub const Filter = struct {
-    filter: Bloom,
-    mask: u64,
-    mask_bits: u32,
+    pub const Filter = struct {
+        filter: Bloom,
+        mask: u64,
+        mask_bits: u32,
+    };
 };
 
 pub const PushMessage = struct {
@@ -39,6 +49,44 @@ pub const PushMessage = struct {
         try writer.writeAll(&pm.sender_pubkey.bytes);
         for (pm.crds) |data| try data.serialize(writer);
     }
+};
+
+pub const PingMessage = struct {
+    from: Pubkey,
+    token: [32]u8,
+    signature: Signature,
+
+    pub const SIZE = 32 + 32 + 64;
+
+    pub fn fromBytes(bytes: []const u8) !PingMessage {
+        if (bytes.len != SIZE) return error.WrongSize;
+        return .{
+            .from = .{ .bytes = bytes[0..32].* },
+            .token = bytes[32..64].*,
+            .signature = .fromBytes(bytes[64..128].*),
+        };
+    }
+
+    const PING_PONG_HASH_PREFIX = "SOLANA_PING_PONG";
+
+    pub fn response(pm: *const PingMessage, kp: *const KeyPair, writer: *std.Io.Writer) !void {
+        std.debug.assert(writer.buffer.len >= SIZE + 4); // ping and pong messages are the same size
+
+        try writer.writeInt(u32, @intFromEnum(Messages.pong_message), .little);
+        try writer.writeAll(&kp.public_key.bytes);
+
+        const hash_bytes = try writer.writableArray(32);
+        Sha256.hash(PING_PONG_HASH_PREFIX ++ pm.token, hash_bytes, .{});
+
+        const signature = try kp.sign(hash_bytes, null);
+        try writer.writeAll(&signature.toBytes());
+    }
+};
+
+const PongMessage = struct {
+    from: Pubkey,
+    hash: [32]u8,
+    signature: [64]u64,
 };
 
 const SignedGossipData = struct {
