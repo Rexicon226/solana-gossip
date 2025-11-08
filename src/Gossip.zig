@@ -34,8 +34,10 @@ startup_timestamp: u64,
 gossip_socket: std.posix.fd_t,
 prng: std.Random.DefaultPrng,
 
+entrypoints: []const Address,
+
 // all the rates are in milliseconds
-const PULL_REQUEST_RATE = 1_000;
+const PULL_REQUEST_RATE = 5_000;
 const MTU = 1232;
 
 const NUM_KEYS = 0;
@@ -55,12 +57,22 @@ const Crds = struct {
     }
 };
 
-pub fn init(g: *Gossip, kp: *const KeyPair, contact_info: ContactInfo) !void {
+pub fn init(
+    g: *Gossip,
+    kp: *const KeyPair,
+    entrypoints: []const Address,
+    contact_info: ContactInfo,
+) !void {
     // open up our gossip socket
-    const gossip_address = contact_info.sockets.get(.gossip);
+    // const gossip_address = contact_info.sockets.get(.gossip);
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
     errdefer posix.close(sockfd);
-    try posix.connect(sockfd, &gossip_address.any, gossip_address.getOsSockLen());
+
+    _ = try std.posix.fcntl(sockfd, std.posix.F.SETFL, @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+
+    // try posix.bind(sockfd, &gossip_address.any, gossip_address.getOsSockLen());
+    const any: Address = .initIp4(@splat(0), 8001);
+    try posix.bind(sockfd, &any.any, any.getOsSockLen());
 
     g.* = .{
         .pull_request = try .init(),
@@ -70,11 +82,12 @@ pub fn init(g: *Gossip, kp: *const KeyPair, contact_info: ContactInfo) !void {
         .crds = .{},
         .startup_timestamp = wallclock(),
         .gossip_socket = sockfd,
+        .entrypoints = entrypoints,
         .prng = .init(wallclock()), // TODO: i'd prefer not to intialize with wall clock
     };
 }
 
-pub fn run(g: *Gossip, entry_points: []const Address) !void {
+pub fn run(g: *Gossip) !void {
     var loop: xev.Loop = try .init(.{});
     defer loop.deinit();
 
@@ -93,22 +106,22 @@ pub fn run(g: *Gossip, entry_points: []const Address) !void {
     );
 
     // setup our pull request timer to trigger every 5 seconds.
-    // var pull_request_completion: xev.Completion = undefined;
-    // g.pull_request.run(
-    //     &loop,
-    //     &pull_request_completion,
-    //     PULL_REQUEST_RATE,
-    //     Gossip,
-    //     g,
-    //     onPullRequest,
-    // );
+    var pull_request_completion: xev.Completion = undefined;
+    g.pull_request.run(
+        &loop,
+        &pull_request_completion,
+        PULL_REQUEST_RATE,
+        Gossip,
+        g,
+        onPullRequest,
+    );
 
     // The node starts the Gossip service and then advertises itself to the cluster
     // by sending messages to the peer identified by the entrypoint. The node sends:
     // - two push messages containing its own Version and NodeInstance
     // - a pull request that contains the node's own LegacyContactInfo
     try g.sendPushMessage(
-        entry_points,
+        g.entrypoints,
         &.{
             .{ .version = .{
                 .from = g.keypair.public_key,
@@ -123,10 +136,7 @@ pub fn run(g: *Gossip, entry_points: []const Address) !void {
             } },
         },
     );
-    try g.sendPullRequest(
-        entry_points,
-        &.{.{ .legacy_contact_info = g.contact_info }},
-    );
+    // we send the pull request in our timer callback
 
     try loop.run(.until_done);
 }
@@ -151,9 +161,8 @@ fn sendPushMessage(
 
     try writer.writeInt(u32, @intFromEnum(Messages.push_message), .little);
     try writer.writeAll(&g.keypair.public_key.bytes);
-    try serializeDatas(&writer, &g.keypair, datas);
-
-    std.debug.print("bytes: {any}\n", .{writer.buffered()});
+    try writer.writeInt(u64, datas.len, .little);
+    for (datas) |data| try serializeData(&writer, &g.keypair, data);
 
     for (targets) |target| {
         const bytes_sent = try std.posix.sendto(
@@ -168,15 +177,12 @@ fn sendPushMessage(
 }
 
 /// Sends the provided push message to each target.
-fn sendPullRequest(
-    g: *Gossip,
-    targets: []const Address,
-    datas: []const GossipData,
-) !void {
+fn sendPullRequest(g: *Gossip, data: GossipData) !void {
     const random = g.prng.random();
 
     // TODO: get from crds table
     const num_items = @max(512, 256);
+    // const max_bits: f64 = @floatFromInt(8 * (MTU - 4 - 8 - (8 * NUM_KEYS) - 1 - 8 - 8 - 8 - 8 - 4 - LegacyContactInfo.SIZE));
     const max_bits: f64 = 123;
 
     const max_items = Bloom.maxItems(max_bits, NUM_KEYS, FALSE_POSITIVE_RATE);
@@ -191,45 +197,55 @@ fn sendPullRequest(
     var payload: [MTU]u8 = @splat(0);
     var writer: std.Io.Writer = .fixed(&payload);
 
-    try writer.writeInt(u32, @intFromEnum(Messages.pull_request), .little);
-    try writer.writeInt(u64, NUM_KEYS, .little);
+    // filter
+    {
+        // bloom filter
+        {
+            try writer.writeInt(u32, @intFromEnum(Messages.pull_request), .little);
 
-    const keys: []align(1) u64 = @ptrCast(try writer.writableSlice(NUM_KEYS * 8));
-    const bits: []align(1) u64 = bits: switch (num_bits) {
-        0 => {
-            try writer.writeByte(0);
-            break :bits &.{};
-        },
-        else => {
-            try writer.writeByte(1); // has_bits
-            try writer.writeInt(u64, bloom_vec_len, .little);
-            break :bits @ptrCast(try writer.writableSlice(bloom_vec_len * 8));
-        },
-    };
+            try writer.writeInt(u64, NUM_KEYS, .little);
+            const keys: []align(1) u64 = @ptrCast(try writer.writableSlice(NUM_KEYS * 8));
 
-    try writer.writeInt(u64, num_bits, .little);
-    const bits_set: *align(1) u64 = @ptrCast(try writer.writableArray(8));
-    try writer.writeInt(u64, mask, .little);
-    try writer.writeInt(u32, offset, .little); // mask bits
+            try writer.writeByte(@intFromBool(num_bits != 0)); // has bits
+            const bits: []align(1) u64 = switch (num_bits) {
+                0 => &.{},
+                else => bits: {
+                    try writer.writeInt(u64, bloom_vec_len, .little);
+                    break :bits @ptrCast(try writer.writableSlice(bloom_vec_len * 8));
+                },
+            };
 
-    const bloom: Bloom = .{
-        .keys = keys,
-        .bits = bits,
-        .max_bits = num_bits,
-    };
-    for (bloom.keys) |*key| key.* = random.int(u64);
+            try writer.writeInt(u64, num_bits, .little);
+            const bits_set: *align(1) u64 = @ptrCast(try writer.writableArray(8));
 
-    // TODO: populate bloom filter
+            const bloom: Bloom = .{
+                .keys = keys,
+                .bits = bits,
+                .max_bits = num_bits,
+            };
+            for (bloom.keys) |*key| key.* = random.int(u64);
 
-    var num_bits_set: u32 = 0;
-    for (bloom.bits) |bit| num_bits_set += @popCount(bit);
-    bits_set.* = num_bits_set;
+            // TODO: populate bloom filter
 
-    try serializeDatas(&writer, &g.keypair, datas);
+            var num_bits_set: u32 = 0;
+            for (bloom.bits) |bit| num_bits_set += @popCount(bit);
+            bits_set.* = num_bits_set;
+        }
+
+        try writer.writeInt(u64, mask, .little);
+        try writer.writeInt(u32, offset, .little); // mask bits
+    }
+
+    var copy = data;
+    switch (copy) {
+        .contact_info => |*ci| ci.wallclock = wallclock(),
+        else => unreachable, // pull request only valid with ContactInfo
+    }
+    try serializeData(&writer, &g.keypair, copy);
 
     // TODO: get peer from table
 
-    for (targets) |target| {
+    for (g.entrypoints) |target| {
         std.debug.print("sending pull request to: {f}\n", .{target});
         const bytes_sent = try std.posix.sendto(
             g.gossip_socket,
@@ -242,23 +258,16 @@ fn sendPullRequest(
     }
 }
 
-fn serializeDatas(
-    writer: *std.Io.Writer,
-    kp: *const KeyPair,
-    datas: []const GossipData,
-) !void {
-    try writer.writeInt(u64, datas.len, .little);
-    for (datas) |data| {
-        // reserve 64 bytes for the signature
-        const sig_bytes = try writer.writableArray(Ed25519.Signature.encoded_length);
+fn serializeData(writer: *std.Io.Writer, kp: *const KeyPair, data: GossipData) !void {
+    // reserve 64 bytes for the signature
+    const sig_bytes = try writer.writableArray(Ed25519.Signature.encoded_length);
 
-        const start = writer.end;
-        try data.serialize(writer);
+    const start = writer.end;
+    try data.serialize(writer);
 
-        // sign the data we just wrote and write it back to the signature slice
-        const signature = try kp.sign(writer.buffered()[start..], null);
-        @memcpy(sig_bytes, &signature.toBytes());
-    }
+    // sign the data we just wrote and write it back to the signature slice
+    const signature = try kp.sign(writer.buffered()[start..], null);
+    @memcpy(sig_bytes, &signature.toBytes());
 }
 
 fn onGossipReply(
@@ -274,14 +283,13 @@ fn onGossipReply(
     errdefer |err| std.debug.panic("onGossipReply failed with: '{s}'", .{@errorName(err)});
     const bytes_read = try read_error;
 
-    _ = bytes_read;
     _ = peer_address;
     _ = read_buffer;
     _ = maybe_gossip;
     _ = loop;
     _ = completion;
 
-    std.debug.print("recved something\n", .{});
+    std.debug.print("recved something {d}\n", .{bytes_read});
 
     return .disarm;
 }
@@ -300,16 +308,12 @@ fn onPullRequest(
 
     const gossip = maybe_gossip.?;
 
-    // // TODO: replace this writer with the socket writer itself, we can fragment and stream the serialization
-    // var payload: [MTU]u8 = undefined;
-    // var writer: std.Io.Writer = .fixed(&payload);
-
-    // try serialize.pullRequest(&writer);
+    try gossip.sendPullRequest(.{ .contact_info = gossip.contact_info });
 
     gossip.pull_request.run(loop, completion, PULL_REQUEST_RATE, Gossip, gossip, onPullRequest);
     return .disarm;
 }
 
-fn wallclock() u64 {
+pub fn wallclock() u64 {
     return @intCast(std.time.milliTimestamp());
 }

@@ -5,18 +5,12 @@ const base58 = @import("base58");
 const spec = @import("spec.zig");
 const Gossip = @import("Gossip.zig");
 
+const IpAddress = spec.IpAddress;
 const Address = std.net.Address;
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const KeyPair = Ed25519.KeyPair;
 const Pubkey = Ed25519.PublicKey;
-
-/// Represents an IPv4 address.
-const IpAddress = struct {
-    octets: [4]u8,
-
-    pub const localhost: IpAddress = .{ .octets = .{ 127, 0, 0, 1 } };
-};
 
 fn resolveAddresses(allocator: std.mem.Allocator, addresses: []const []const u8) ![]const Address {
     var result = try allocator.alloc(Address, addresses.len);
@@ -125,10 +119,10 @@ pub fn main() !void {
     const gossip_port: u16 = 8001;
 
     const entrypoints: []const []const u8 = &.{
-        "entrypoint.testnet.solana.com:8001",
-        "entrypoint2.testnet.solana.com:8001",
+        // "entrypoint.testnet.solana.com:8001",
+        // "entrypoint2.testnet.solana.com:8001",
         // "entrypoint3.testnet.solana.com:8001",
-        // "127.0.0.1:8000",
+        "127.0.0.1:8000",
     };
 
     const addresses = try resolveAddresses(allocator, entrypoints);
@@ -146,15 +140,24 @@ pub fn main() !void {
 
     var contact_info: spec.ContactInfo = .{
         .pubkey = my_keypair.public_key,
-        .shred_version = info.shred_version,
-        .sockets = .initFill(try .parseIp("0.0.0.0", 0)),
         .wallclock = 0, // changed when we sign
+        .startup = Gossip.wallclock(),
+        .shred_version = info.shred_version,
+        .version = .{
+            .major = 0,
+            .minor = 1,
+            .patch = 0,
+            .commit = 1234,
+            .feature_set = 12345,
+            .client = 5,
+        },
+        .sockets = .initFill(try .parseIp("0.0.0.0", 0)),
     };
     contact_info.sockets.set(.gossip, .initIp4(info.ip.octets, gossip_port));
 
     var gossip: Gossip = undefined;
-    try gossip.init(&my_keypair, contact_info);
-    try gossip.run(addresses);
+    try gossip.init(&my_keypair, addresses, contact_info);
+    try gossip.run();
 }
 
 fn formatPubkey(pubkey: Pubkey) std.fmt.Alt(Pubkey, fmtPubkey) {

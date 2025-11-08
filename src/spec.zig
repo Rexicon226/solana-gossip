@@ -11,9 +11,18 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const Signature = Ed25519.Signature;
 const Pubkey = Ed25519.PublicKey;
 
+const any_address: Address = .initIp4(.{ 0, 0, 0, 0 }, 0);
+
+/// Represents an IPv4 address.
+pub const IpAddress = struct {
+    octets: [4]u8,
+
+    pub const localhost: IpAddress = .{ .octets = .{ 127, 0, 0, 1 } };
+};
+
 pub const PullRequest = struct {
     filter: Filter,
-    gossip_data: []const SignedGossipData,
+    gossip_data: SignedGossipData,
 };
 
 pub const Filter = struct {
@@ -43,7 +52,7 @@ const SignedGossipData = struct {
 };
 
 pub const GossipData = union(enum) {
-    legacy_contact_info: ContactInfo,
+    legacy_contact_info: noreturn,
     vote: noreturn,
     lowest_slot: noreturn,
     legacy_snapshot_hashes: noreturn,
@@ -54,7 +63,7 @@ pub const GossipData = union(enum) {
     node_instance: NodeInstance,
     duplicate_shred: noreturn,
     snapshot_hashes: noreturn,
-    contact_info: noreturn,
+    contact_info: ContactInfo,
     restart_last_voted_fork_slots: noreturn,
     restart_heaviest_fork: noreturn,
 
@@ -74,17 +83,6 @@ pub const GossipData = union(enum) {
     pub fn serialize(cd: *const GossipData, writer: *std.Io.Writer) !void {
         try writer.writeInt(u32, @intFromEnum(cd.*), .little);
         switch (cd.*) {
-            .legacy_contact_info => |ci| {
-                try writer.writeAll(&ci.pubkey.bytes);
-                for (ci.sockets.values) |socket| switch (socket.any.family) {
-                    std.posix.AF.INET => {
-                        try writer.writeInt(u32, 0, .little); // ipv4 address
-                        try writer.writeInt(u32, socket.in.sa.addr, .little);
-                        try writer.writeInt(u16, socket.in.sa.port, .little);
-                    },
-                    else => @panic("TODO: support ipv6"),
-                };
-            },
             .version => |v| {
                 try writer.writeAll(&v.from.bytes);
                 try writer.writeInt(u64, v.wallclock, .little);
@@ -95,6 +93,83 @@ pub const GossipData = union(enum) {
                 try writer.writeInt(u64, ni.wallclock, .little);
                 try writer.writeInt(u64, ni.timestamp, .little);
                 try writer.writeInt(u64, ni.token, .little);
+            },
+            .contact_info => |ci| {
+                try writer.writeAll(&ci.pubkey.bytes);
+                try writer.writeUleb128(ci.wallclock);
+                try writer.writeInt(u64, ci.startup, .little); // outset
+                try writer.writeInt(u16, ci.shred_version, .little);
+                try ci.version.serialize(writer);
+
+                var addrs: [SocketTag.NUM]Address = undefined;
+                var addrs_len: u8 = 0;
+                var sockets: [SocketTag.NUM]ContactInfo.SocketEntry = undefined;
+                var sockets_len: u8 = 0;
+
+                const Scratch = struct {
+                    addr: Address,
+                    tag: u8,
+                    fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                        return lhs.addr.getPort() < rhs.addr.getPort();
+                    }
+                };
+                var scratch: [SocketTag.NUM]Scratch = undefined;
+                var scratch_len: u8 = 0;
+                for (ci.sockets.values, 0..) |entry, i| {
+                    if (!entry.eql(any_address)) { // if it's initialized
+                        defer scratch_len += 1;
+                        scratch[scratch_len].addr = entry;
+                        scratch[scratch_len].addr.setPort(@byteSwap(entry.getPort()));
+                        scratch[scratch_len].tag = @intCast(i); // less than 2^7 sockets, so always 1 byte tag in shortvec
+                    }
+                }
+                const sorted = scratch[0..scratch_len];
+                std.sort.block(Scratch, sorted, {}, Scratch.lessThan);
+
+                addrs[0] = sorted[0].addr;
+                addrs_len += 1;
+                sockets[0] = .{
+                    .port_offset = sorted[0].addr.getPort(),
+                    .addr_index = 0,
+                    .tag = sorted[0].tag,
+                };
+                sockets_len += 1;
+
+                // perform a bit of compression by re-using existing addresses
+                for (sorted[1..], 0..) |*socket, i| {
+                    var found: bool = false;
+                    for (addrs[0..addrs_len], 0..) |addr, j| {
+                        if (addr.eql(socket.addr)) {
+                            defer sockets_len += 1;
+                            sockets[sockets_len].addr_index = @intCast(j);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        defer addrs_len += 1;
+                        addrs[addrs_len] = socket.addr;
+                        sockets[addrs_len].addr_index = addrs_len;
+                    }
+                    sockets[sockets_len].port_offset = socket.addr.getPort() - sorted[i - 1].addr.getPort();
+                    sockets[sockets_len].tag = socket.tag;
+                    sockets_len += 1;
+                }
+
+                try writer.writeByte(addrs_len);
+                for (addrs[0..addrs_len]) |addr| {
+                    try writer.writeInt(u32, 0, .little);
+                    try writer.writeInt(u32, addr.in.sa.addr, .little);
+                }
+
+                try writer.writeByte(sockets_len);
+                for (sockets[0..sockets_len]) |socket| {
+                    try writer.writeByte(socket.tag);
+                    try writer.writeByte(socket.addr_index);
+                    try writer.writeUleb128(socket.port_offset);
+                }
+
+                try writer.writeByte(0); // extensions, always empty for now
             },
             else => @panic("TODO"),
         }
@@ -120,9 +195,44 @@ pub const LegacyVersion2 = struct {
     }
 };
 
+pub const ContactInfo = struct {
+    pubkey: Pubkey,
+    wallclock: u64,
+    startup: u64,
+    shred_version: u16,
+    version: Version,
+    sockets: std.EnumArray(SocketTag, Address),
+
+    const Version = struct {
+        major: u16,
+        minor: u16,
+        patch: u16,
+        commit: u32,
+        feature_set: u32,
+        client: u16,
+
+        fn serialize(v: *const Version, writer: *std.Io.Writer) !void {
+            try writer.writeUleb128(v.major);
+            try writer.writeUleb128(v.minor);
+            try writer.writeUleb128(v.patch);
+            try writer.writeInt(u32, v.commit, .little);
+            try writer.writeInt(u32, v.feature_set, .little);
+            try writer.writeUleb128(v.client);
+        }
+    };
+
+    const SocketEntry = struct {
+        port_offset: u16,
+        tag: u8,
+        addr_index: u8,
+    };
+
+    pub const SIZE = 32 + (SocketTag.NUM * 10) + 8 + 2;
+};
+
 pub const SocketTag = enum(u8) {
     gossip = 0,
-    repair = 1,
+    serve_repair_quic = 1,
     rpc = 2,
     rpc_pubsub = 3,
     serve_repair = 4,
@@ -136,17 +246,8 @@ pub const SocketTag = enum(u8) {
     tpu_vote_quic = 12,
     alpenglow = 13,
 
+    const NUM = @typeInfo(SocketTag).@"enum".fields.len;
     comptime {
-        std.debug.assert(@typeInfo(SocketTag).@"enum".fields.len == 14);
+        std.debug.assert(NUM < (1 << 7));
     }
-};
-
-pub const ContactInfo = struct {
-    /// Identity public key of the peer node.
-    pubkey: Pubkey,
-    /// Shred version of the peer node.
-    shred_version: u16,
-    /// Wallclock of when the contact info is signed.
-    wallclock: u64,
-    sockets: std.EnumArray(SocketTag, Address),
 };
